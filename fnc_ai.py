@@ -136,7 +136,7 @@ def evaluate(model, val_loader, device):
                 axes[2].imshow(predicted_np[i], cmap="tab20")
                 axes[2].set_title("Prediction")
 
-                plt.pause(0.005)
+                plt.pause(0.0005)
 
     # Disable interactive mode
     plt.ioff()
@@ -164,8 +164,8 @@ def train(model, train_loader, val_loader, device, epochs=10):
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(train_loader):.4f}")
         scheduler.step()
 
-        # Evaluate the model after each 2 epochs
-        if (epoch + 1) % 2 == 0:
+        # Evaluate the model at the end of the final epoch
+        if epoch == epochs - 1:
             evaluate(model, val_loader, device)
 
 
