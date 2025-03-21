@@ -50,7 +50,8 @@ class PascalVOCDataset(Dataset):
             mask = self.mask_transform(mask)
             mask = torch.from_numpy(np.array(mask, dtype=np.int64))
 
-        mask = torch.clamp(mask, 0, 20)  # Ensure mask values are in the range [0, 20]
+        # Mask values are in the range [0, 20]
+        mask = torch.clamp(mask, 0, 20)
         return image, mask
 
 
@@ -72,9 +73,8 @@ train_dataset = PascalVOCDataset(root_dir='./dataset/VOC2012_train_val', image_s
 val_dataset = PascalVOCDataset(root_dir='./dataset/VOC2012_train_val', image_set='val',
                                transform=transform, mask_transform=mask_transform)
 
-MAX_CPU = 4
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=MAX_CPU)
-val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=MAX_CPU)
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
 
 
 class ImprovedFCN(nn.Module):
@@ -111,7 +111,7 @@ def evaluate(model, val_loader, device):
     model.eval()
     correct_pixels, total_pixels = 0, 0
 
-    plt.ion()  # Enable interactive mode for live updating
+    plt.ion()
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
 
     with torch.no_grad():
@@ -136,9 +136,10 @@ def evaluate(model, val_loader, device):
                 axes[2].imshow(predicted_np[i], cmap="tab20")
                 axes[2].set_title("Prediction")
 
-                plt.pause(0.05)  # Pause to update plot
+                plt.pause(0.005)
 
-    plt.ioff()  # Disable interactive mode
+    # Disable interactive mode
+    plt.ioff()
     plt.close(fig)
 
     accuracy = correct_pixels / total_pixels
@@ -163,10 +164,12 @@ def train(model, train_loader, val_loader, device, epochs=10):
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(train_loader):.4f}")
         scheduler.step()
 
-        # Evaluate the model after each 5 epochs
-        if (epoch + 1) % 5 == 0:
+        # Evaluate the model after each 2 epochs
+        if (epoch + 1) % 2 == 0:
             evaluate(model, val_loader, device)
 
 
 train(model, train_loader, val_loader, device)
 torch.save(model.state_dict(), 'improved_model.pth')
+
+# https://medium.com/data-science/review-fcn-semantic-segmentation-eb8c9b50d2d1
