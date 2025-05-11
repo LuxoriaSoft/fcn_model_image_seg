@@ -8,15 +8,26 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
-import multiprocessing
+
+# --- Device Setup ---
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    device_type = "mac_mps"
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+    device_type = "cuda"
+else:
+    device = torch.device("cpu")
+    device_type = "cpu"
+
+print(f"[INFO] Using device: {device} ({device_type})")
 
 # --- Configuration ---
-usable_cores = max(multiprocessing.cpu_count() - 2, 1)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 21
 image_size = (256, 256)
-batch_size = 4
+batch_size = 2 if device_type == "mac_mps" else 4
 epochs = 10
+num_workers = 0 if device_type == "mac_mps" else os.cpu_count() - 2
 
 # --- Dataset ---
 class PascalVOCDataset(Dataset):
@@ -24,7 +35,6 @@ class PascalVOCDataset(Dataset):
         self.transform = transform
         self.mask_transform = mask_transform
         base_dir = os.path.join(root_dir, 'VOC2012_train_val')
-
         with open(os.path.join(base_dir, 'ImageSets', 'Segmentation', f'{image_set}.txt')) as f:
             image_ids = [line.strip() for line in f.readlines()]
 
@@ -50,12 +60,8 @@ def mask_to_tensor(mask):
 # --- Transforms ---
 image_transform = transforms.Compose([
     transforms.Resize(image_size),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
     transforms.ToTensor(),
 ])
-
 mask_transform = transforms.Compose([
     transforms.Resize(image_size, interpolation=Image.NEAREST),
     transforms.Lambda(mask_to_tensor)
@@ -65,8 +71,8 @@ mask_transform = transforms.Compose([
 train_dataset = PascalVOCDataset('./dataset/VOC2012_train_val', 'train', image_transform, mask_transform)
 val_dataset = PascalVOCDataset('./dataset/VOC2012_train_val', 'val', image_transform, mask_transform)
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=usable_cores)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=usable_cores)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 # --- Model ---
 class ImprovedFCN(nn.Module):
@@ -88,7 +94,7 @@ class ImprovedFCN(nn.Module):
         x = self.decoder(x)
         return F.interpolate(x, size=image_size, mode='bilinear', align_corners=False)
 
-# --- Losses ---
+# --- Loss ---
 def dice_loss(pred, target, smooth=1e-6):
     pred = F.softmax(pred, dim=1)
     target = F.one_hot(target, num_classes=num_classes).permute(0, 3, 1, 2).float()
@@ -96,7 +102,7 @@ def dice_loss(pred, target, smooth=1e-6):
     union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
     return 1 - ((2. * intersection + smooth) / (union + smooth)).mean()
 
-# --- Metrics ---
+# --- Evaluation ---
 def mean_iou(pred, target):
     pred = torch.argmax(pred, dim=1)
     ious = []
@@ -121,11 +127,9 @@ def evaluate(model, loader):
             images, masks = images.to(device), masks.to(device)
             outputs = model(images)
             preds = torch.argmax(outputs, dim=1)
-
             total_iou += mean_iou(outputs, masks)
             total_correct += (preds == masks).sum().item()
             total_pixels += torch.numel(masks)
-
             for cls in range(num_classes):
                 cls_mask = (masks == cls)
                 class_correct[cls] += ((preds == cls) & cls_mask).sum()
@@ -182,10 +186,10 @@ def export_onnx(model, export_path='improved_fcn.onnx'):
 
 # --- Main ---
 if __name__ == "__main__":
-    print(f"[INFO] Loaded {len(train_dataset)} images for 'train' set.")
-    print(f"[INFO] Loaded {len(val_dataset)} images for 'val' set.")
+    print(f"[INFO] Loaded {len(train_dataset)} training samples.")
+    print(f"[INFO] Loaded {len(val_dataset)} validation samples.")
 
     model = ImprovedFCN(num_classes=num_classes).to(device)
     train(model, train_loader, val_loader, epochs=epochs)
-    torch.save(model.state_dict(), 'improved_fcn_final.pth')
-    export_onnx(model, 'improved_fcn.onnx')
+    torch.save(model.state_dict(), '202505.improved_fcn.pth')
+    export_onnx(model, '202505.improved_fcn.onnx')
