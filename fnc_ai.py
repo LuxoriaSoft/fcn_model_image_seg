@@ -1,36 +1,35 @@
+import os
+import time
 import torch
-from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import numpy as np
 from PIL import Image
-import os
-import matplotlib.pyplot as plt
+import numpy as np
 from tqdm import tqdm
+import multiprocessing
 
+# --- Configuration ---
+usable_cores = max(multiprocessing.cpu_count() - 2, 1)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+num_classes = 21
+image_size = (256, 256)
+batch_size = 4
+epochs = 10
+
+# --- Dataset ---
 class PascalVOCDataset(Dataset):
     def __init__(self, root_dir, image_set='train', transform=None, mask_transform=None):
-        self.root_dir = root_dir
-        self.image_set = image_set
         self.transform = transform
         self.mask_transform = mask_transform
+        base_dir = os.path.join(root_dir, 'VOC2012_train_val')
 
-        self.images = []
-        self.masks = []
+        with open(os.path.join(base_dir, 'ImageSets', 'Segmentation', f'{image_set}.txt')) as f:
+            image_ids = [line.strip() for line in f.readlines()]
 
-        with open(os.path.join(root_dir, 'VOC2012_train_val', 'ImageSets', 'Segmentation', f'{image_set}.txt'), 'r') as f:
-            image_ids = f.readlines()
-
-        for image_id in image_ids:
-            image_id = image_id.strip()
-            image_path = os.path.join(root_dir, 'VOC2012_train_val', 'JPEGImages', f'{image_id}.jpg')
-            mask_path = os.path.join(root_dir, 'VOC2012_train_val', 'SegmentationClass', f'{image_id}.png')
-
-            self.images.append(image_path)
-            self.masks.append(mask_path)
-
-        print(f"Loaded {len(self.images)} images and masks from the dataset.")
+        self.images = [os.path.join(base_dir, 'JPEGImages', f'{img_id}.jpg') for img_id in image_ids]
+        self.masks = [os.path.join(base_dir, 'SegmentationClass', f'{img_id}.png') for img_id in image_ids]
 
     def __len__(self):
         return len(self.images)
@@ -38,192 +37,155 @@ class PascalVOCDataset(Dataset):
     def __getitem__(self, idx):
         image = Image.open(self.images[idx]).convert('RGB')
         mask = Image.open(self.masks[idx])
-
         if self.transform:
-            seed = np.random.randint(2147483647)
-            torch.manual_seed(seed)
             image = self.transform(image)
-
         if self.mask_transform:
-            torch.manual_seed(seed)
             mask = self.mask_transform(mask)
-            mask = torch.from_numpy(np.array(mask, dtype=np.int64))
-
-        mask = torch.clamp(mask, 0, 20)
+        mask = torch.clamp(mask, 0, num_classes - 1)
         return image, mask
 
 def mask_to_tensor(mask):
     return torch.from_numpy(np.array(mask, dtype=np.int64))
 
-transform = transforms.Compose([
-    transforms.Resize((256, 256)),
+# --- Transforms ---
+image_transform = transforms.Compose([
+    transforms.Resize(image_size),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
     transforms.ToTensor(),
 ])
 
 mask_transform = transforms.Compose([
-    transforms.Resize((256, 256), interpolation=Image.NEAREST),
+    transforms.Resize(image_size, interpolation=Image.NEAREST),
     transforms.Lambda(mask_to_tensor)
 ])
 
-train_dataset = PascalVOCDataset(root_dir='./dataset/VOC2012_train_val', image_set='train',
-                                 transform=transform, mask_transform=mask_transform)
-val_dataset = PascalVOCDataset(root_dir='./dataset/VOC2012_train_val', image_set='val',
-                               transform=transform, mask_transform=mask_transform)
+# --- Data Loaders ---
+train_dataset = PascalVOCDataset('./dataset/VOC2012_train_val', 'train', image_transform, mask_transform)
+val_dataset = PascalVOCDataset('./dataset/VOC2012_train_val', 'val', image_transform, mask_transform)
 
-train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=usable_cores)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=usable_cores)
 
-# Dice Loss function
-def dice_loss(pred, target, smooth=1e-6):
-    pred = torch.argmax(pred, dim=1)  # Convert predictions to class indices (most likely class)
-    
-    intersection = (pred == target).sum()  # Calculate intersection for Dice coefficient
-    return 1 - (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
-
-# Combined Loss (CrossEntropy + Dice Loss)
-class CombinedLoss(nn.Module):
-    def __init__(self, weight=None, ignore_index=255):
-        super(CombinedLoss, self).__init__()
-        self.ce_loss = nn.CrossEntropyLoss(weight=weight, ignore_index=ignore_index)
-        self.dice_loss = dice_loss
-
-    def forward(self, outputs, targets):
-        ce = self.ce_loss(outputs, targets)
-        dice = self.dice_loss(outputs, targets)
-        return ce + dice
-
-# Improved FCN Model
+# --- Model ---
 class ImprovedFCN(nn.Module):
-    def __init__(self, num_classes=21):
-        super(ImprovedFCN, self).__init__()
-
-        # Encoder (downsampling)
-        self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, 256, 3, padding=1)
-        self.bn3 = nn.BatchNorm2d(256)
-
-        # Decoder (upsampling) using transposed convolutions
-        self.deconv1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.deconv2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.deconv3 = nn.ConvTranspose2d(64, num_classes, kernel_size=2, stride=2)
-
-        # Final layer to reduce the output size to 256x256
-        self.final_upsample = nn.Upsample(size=(256, 256), mode='bilinear', align_corners=False)
+    def __init__(self, num_classes):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.ConvTranspose2d(64, num_classes, 3, stride=2, padding=1, output_padding=1)
+        )
 
     def forward(self, x):
-        # Encoder
-        x1 = F.relu(self.bn1(self.conv1(x)))
-        x2 = F.relu(self.bn2(self.conv2(x1)))
-        x3 = F.relu(self.bn3(self.conv3(x2)))
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return F.interpolate(x, size=image_size, mode='bilinear', align_corners=False)
 
-        # Decoder with skip connections (using upsampling to match the sizes)
-        x = self.deconv1(x3)
-        x2_upsampled = F.interpolate(x2, size=x.size()[2:], mode='bilinear', align_corners=False)  # Upsample x2 to match size of x
-        x = x + x2_upsampled  # Skip connection
-        x = self.deconv2(x)
-        x1_upsampled = F.interpolate(x1, size=x.size()[2:], mode='bilinear', align_corners=False)  # Upsample x1 to match size of x
-        x = x + x1_upsampled  # Skip connection
-        x = self.deconv3(x)
+# --- Losses ---
+def dice_loss(pred, target, smooth=1e-6):
+    pred = F.softmax(pred, dim=1)
+    target = F.one_hot(target, num_classes=num_classes).permute(0, 3, 1, 2).float()
+    intersection = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    return 1 - ((2. * intersection + smooth) / (union + smooth)).mean()
 
-        # Ensure final output size is 256x256
-        x = self.final_upsample(x)
-
-        return x
-
-# IoU Calculation
-def calculate_iou(pred, target, num_classes=21):
-    iou = []
-    pred = pred.view(-1)
-    target = target.view(-1)
-
+# --- Metrics ---
+def mean_iou(pred, target):
+    pred = torch.argmax(pred, dim=1)
+    ious = []
     for cls in range(num_classes):
-        intersection = ((pred == cls) & (target == cls)).sum().item()
-        union = ((pred == cls) | (target == cls)).sum().item()
-        iou.append(intersection / (union + 1e-6))  # Add small epsilon to avoid division by zero
+        pred_cls = pred == cls
+        target_cls = target == cls
+        intersection = (pred_cls & target_cls).sum().float()
+        union = (pred_cls | target_cls).sum().float()
+        ious.append((intersection / union) if union > 0 else torch.tensor(1.0, device=pred.device))
+    return torch.mean(torch.stack(ious))
 
-    return np.mean(iou)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = ImprovedFCN(num_classes=21).to(device)
-
-weights = torch.ones(21).to(device)
-weights[0] = 0.1  # Reduce the importance of background class
-
-criterion = CombinedLoss(weight=weights, ignore_index=255)
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, steps_per_epoch=len(train_loader), epochs=10)
-
-# Evaluation Function
-def evaluate(model, val_loader, device):
+def evaluate(model, loader):
     model.eval()
-    correct_pixels, total_pixels = 0, 0
-    iou_list = []
-
-    plt.ion()
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    total_iou = 0
+    total_correct = 0
+    total_pixels = 0
+    class_correct = torch.zeros(num_classes, device=device)
+    class_total = torch.zeros(num_classes, device=device)
 
     with torch.no_grad():
-        for inputs, targets in tqdm(val_loader, desc="Evaluating"):
-            inputs, targets = inputs.to(device), targets.to(device)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
+        for images, masks in tqdm(loader, desc='Evaluating'):
+            images, masks = images.to(device), masks.to(device)
+            outputs = model(images)
+            preds = torch.argmax(outputs, dim=1)
 
-            correct_pixels += (predicted == targets).sum().item()
-            total_pixels += targets.numel()
+            total_iou += mean_iou(outputs, masks)
+            total_correct += (preds == masks).sum().item()
+            total_pixels += torch.numel(masks)
 
-            # Calculate IoU
-            iou = calculate_iou(predicted, targets)
-            iou_list.append(iou)
+            for cls in range(num_classes):
+                cls_mask = (masks == cls)
+                class_correct[cls] += ((preds == cls) & cls_mask).sum()
+                class_total[cls] += cls_mask.sum()
 
-            # Real-time visualization
-            inputs_np = inputs.cpu().numpy().transpose(0, 2, 3, 1)
-            targets_np = targets.cpu().numpy()
-            predicted_np = predicted.cpu().numpy()
+    pixel_accuracy = total_correct / total_pixels
+    mean_class_accuracy = (class_correct / class_total.clamp(min=1)).mean()
 
-            for i in range(inputs_np.shape[0]):
-                axes[0].imshow(inputs_np[i])
-                axes[0].set_title("Input Image")
-                axes[1].imshow(targets_np[i], cmap="tab20")
-                axes[1].set_title("Ground Truth")
-                axes[2].imshow(predicted_np[i], cmap="tab20")
-                axes[2].set_title("Prediction")
+    print(f"[Validation] mIoU: {total_iou / len(loader):.4f}")
+    print(f"[Validation] Pixel Accuracy: {pixel_accuracy:.4f}")
+    print(f"[Validation] Mean Class Accuracy: {mean_class_accuracy:.4f}")
 
-                plt.pause(0.0005)
+# --- Training ---
+def train(model, train_loader, val_loader, epochs):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0]*num_classes, device=device))
 
-    # Disable interactive mode
-    plt.ioff()
-    plt.close(fig)
-
-    accuracy = correct_pixels / total_pixels
-    mean_iou = np.mean(iou_list)
-    print(f"Validation Accuracy: {accuracy:.4f}, Mean IoU: {mean_iou:.4f}")
-
-# Training Loop
-def train(model, train_loader, val_loader, device, epochs=10):
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
+        start_time = time.time()
 
-        for inputs, targets in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
-            inputs, targets = inputs.to(device), targets.to(device)
+        for images, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+            images, masks = images.to(device), masks.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            outputs = model(images)
+            loss = criterion(outputs, masks) + dice_loss(outputs, masks)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
 
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {running_loss / len(train_loader):.4f}")
-        scheduler.step()
+        avg_loss = running_loss / len(train_loader)
+        scheduler.step(avg_loss)
+        print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f} | Time: {time.time() - start_time:.2f}s")
 
-        # Evaluate the model at the end of the final epoch
-        if epoch == epochs - 1:
-            evaluate(model, val_loader, device)
+        if epoch == 0 or (epoch + 1) % 5 == 0:
+            evaluate(model, val_loader)
 
-train(model, train_loader, val_loader, device)
-torch.save(model.state_dict(), 'improved_model2.pth')
+        torch.save(model.state_dict(), f'improved_fcn_epoch_{epoch+1}.pth')
+
+# --- ONNX Export ---
+def export_onnx(model, export_path='improved_fcn.onnx'):
+    model.eval()
+    dummy_input = torch.randn(1, 3, *image_size).to(device)
+    torch.onnx.export(
+        model, dummy_input, export_path,
+        export_params=True, opset_version=11,
+        do_constant_folding=True,
+        input_names=['input'], output_names=['output'],
+        dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+    )
+    print(f"[ONNX] Model exported to {export_path}")
+
+# --- Main ---
+if __name__ == "__main__":
+    print(f"[INFO] Loaded {len(train_dataset)} images for 'train' set.")
+    print(f"[INFO] Loaded {len(val_dataset)} images for 'val' set.")
+
+    model = ImprovedFCN(num_classes=num_classes).to(device)
+    train(model, train_loader, val_loader, epochs=epochs)
+    torch.save(model.state_dict(), 'improved_fcn_final.pth')
+    export_onnx(model, 'improved_fcn.onnx')
