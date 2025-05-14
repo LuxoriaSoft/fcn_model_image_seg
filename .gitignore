@@ -1,3 +1,10 @@
 Pascal VOC 2012 Dataset.zip
-*.zipp
+*.zip
+*.pth
+*.tar
+*.jpg
+*.txt
+.vscode
+.venv
+__pycache__
 dataset
