@@ -1,6 +1,7 @@
 Pascal VOC 2012 Dataset.zip
 *.zip
 *.pth
+*.onnx
 *.tar
 *.jpg
 *.txt

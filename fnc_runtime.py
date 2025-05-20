@@ -1,82 +1,67 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import torch.nn as nn
-import torch.nn.functional as F
-from PIL import Image
+import sys
+import onnxruntime as ort
 import numpy as np
-import os
+from PIL import Image
 import matplotlib.pyplot as plt
 
-# Load the trained model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Define the model class again
-class SimpleFCN(nn.Module):
-    def __init__(self, num_classes=21):
-        super(SimpleFCN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.fc = nn.Conv2d(256, num_classes, kernel_size=1)  # Output layer
+image_size = (256, 256)
+num_classes = 21
+onnx_model_path = "unet_final.onnx"
 
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = self.fc(x)
-        return x
+# Using program arguments for flexibility
+if len(sys.argv) != 2:
+    print("Usage: python fnc_runtime.py <image_path>")
+    sys.exit(1)
+image_path = sys.argv[1]
 
-# Initialize the model and load the checkpoint
-model = SimpleFCN(num_classes=21).to(device)
-model.load_state_dict(torch.load('model_checkpoint.pth'))
-model.eval()  # Set the model to evaluation mode
+# Load ONNX model
+print("[INFO] Loading ONNX model...")
+session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 
-# Define transformations (resize, normalize)
-transform = transforms.Compose([
-    transforms.Resize((256, 256)),   # Resize image
-    transforms.ToTensor(),           # Convert image to tensor
-])
+# Load and Preprocess Input Image
+print("[INFO] Loading image...")
+image = Image.open(image_path).convert("RGB").resize(image_size)
+image_np = np.array(image).astype(np.float32) / 255.0
+image_np = image_np.transpose(2, 0, 1)  # HWC -> CHW
+image_np = np.expand_dims(image_np, axis=0)  # Add batch dimension
 
-# Function to process and predict
-def predict(image_path):
-    # Load the image
-    image = Image.open(image_path).convert('RGB')
+# Run the model
+print("[INFO] Running inference...")
+outputs = session.run(["output"], {"input": image_np})[0]
+preds = np.argmax(outputs, axis=1)[0]  # Shape: (H, W)
 
-    # Apply the same transformation as during training
-    image_tensor = transform(image).unsqueeze(0).to(device)  # Add batch dimension and move to device
+# Decode segmentation mask
+label_colors = np.array([
+    [0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
+    [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
+    [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
+    [64, 0, 128], [192, 0, 128], [64, 128, 128], [192, 128, 128],
+    [0, 64, 0], [128, 64, 0], [0, 192, 0], [128, 192, 0], [0, 64, 128]
+], dtype=np.uint8)
 
-    # Make the prediction
-    with torch.no_grad():
-        output = model(image_tensor)  # Get the raw model output
+def decode_segmap(mask):
+    r = np.zeros_like(mask, dtype=np.uint8)
+    g = np.zeros_like(mask, dtype=np.uint8)
+    b = np.zeros_like(mask, dtype=np.uint8)
+    for l in range(num_classes):
+        idx = mask == l
+        r[idx], g[idx], b[idx] = label_colors[l]
+    return np.stack([r, g, b], axis=2)
 
-    # Get the predicted class (argmax over channels)
-    _, predicted = torch.max(output, 1)  # Get the class with the highest probability
+decoded_mask = decode_segmap(preds)
 
-    print(predicted)
+# Show the input image and predicted mask
+plt.figure(figsize=(10, 4))
+plt.subplot(1, 2, 1)
+plt.imshow(image)
+plt.title("Input Image")
+plt.axis('off')
 
-    # Convert predicted tensor to numpy for visualization
-    predicted = predicted.squeeze(0).cpu().numpy()  # Remove batch dimension and move to CPU
+plt.subplot(1, 2, 2)
+plt.imshow(decoded_mask)
+plt.title("Predicted Mask")
+plt.axis('off')
 
-    return predicted, image
-
-# Function to visualize the result
-def visualize(image, predicted_mask):
-    # Display the image and the predicted mask
-    fig, ax = plt.subplots(1, 2, figsize=(12, 6))
-    
-    ax[0].imshow(image)
-    ax[0].set_title('Input Image')
-    ax[0].axis('off')
-    
-    # Show the predicted mask with the color map (tab20b for 21 classes)
-    ax[1].imshow(predicted_mask, cmap='tab20b')  # Use a colormap for visualizing the classes
-    ax[1].set_title('Predicted Segmentation')
-    ax[1].axis('off')
-
-    plt.show()
-
-# Test the program with an example image
-image_path = 'image2.jpg'  # Specify the path to your input image
-predicted_mask, image = predict(image_path)
-visualize(image, predicted_mask)
+plt.tight_layout()
+plt.show()
