@@ -1,5 +1,6 @@
 import os
 import time
+import onnx
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +11,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
+
+print("[INFO] Importing libraries...")
+print("[INFO] PyTorch version:", torch.__version__)
+print("[INFO] CUDA available:", torch.cuda.is_available())
+print("[INFO] MPS available:", torch.backends.mps.is_available())
+print("[INFO] ONNX version:", onnx.__version__)
+print("[INFO] NumPy version:", np.__version__)
+print("[INFO] PIL version:", Image.__version__)
+print("[INFO] Dataset version: VOC2012")
 
 # --- Device Setup ---
 if torch.backends.mps.is_available():
