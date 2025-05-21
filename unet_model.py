@@ -66,7 +66,6 @@ class PascalVOCDataset(Dataset):
         mask[mask == 255] = 0
         mask = torch.clamp(mask, 0, num_classes - 1)
         return image, mask
-
 def mask_to_tensor(mask):
     return torch.from_numpy(np.array(mask, dtype=np.int64))
 
